@@ -1,0 +1,41 @@
+version:      0.2
+
+phases:
+  install:
+    commands:
+      # - yum update -y
+      - yum install mysql -y
+      - pip install awscli --upgrade
+      - cd lib
+      - sh ./deploy.sh
+      - cd ..
+      - sh ./get-param-file.sh $AppEnvironment
+      - cd sam-templates
+      - sh ./build-sam.sh
+      - mv cfn-sam.yml ..
+      - cd ..
+  build:
+    commands:
+      - echo Testing if database exists for $AURORADBNAME and if not, we will hydrate as part of the first build
+      - sh ./cfnpipeline/scripts/checkAuroraForDB.sh
+      - echo Entering build phase...
+      - echo Build started on `date`
+      - mvn clean package
+      - python ./cfnpipeline/scripts/json-tags-to-yaml.py $AppEnvironment cfn-sam.yml
+      - aws cloudformation package --template cfn-sam.yml --s3-bucket $S3_BUCKET --output-template template-export.yml
+
+artifacts:
+  files:
+    - template-export.yml
+    - cfn-sam-params.json
+    - DataRetrival/target/DataRetrival.jar
+    - FaultLookup/target/FaultLookup.jar
+    - FCA/target/FCA.jar
+    - GenericParser/target/GenericParser.jar
+    - HBStorage/target/HBStorage.jar
+    - IR/target/IR.jar
+    - PeoplenetDataIngestor/target/PeoplenetDataIngestor.jar
+    - ProcessedData/target/ProcessedData.jar
+    - SDKDataIngestor/target/SDKDataIngestor.jar
+    - SDKParser/target/SDKParser.jar
+    - PaccarExternalResponseMismatch/target/PaccarExternalResponseMismatch.jar
