@@ -1,0 +1,615 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Resources for JVFaultGuidance-API Application
+Parameters:
+  ApplicationEnvironmentTag:
+    Type: String
+    Description: Deployment environment variable
+  ApplicationName:
+    Type: String
+    Description: Deployment environment variable
+  Portfolio:
+    Type: String
+    Default: faultguidance
+  RepositoryUri:
+    Type: String
+Resources:
+  #ECS resources Cloudformation
+  #Resources - Cluster, Service, SecurityGroup, SecurityGroupIngress, TaskDefinition, Role,NLB Target group, NLB Listener, VPC link
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${ApplicationName}-${ApplicationEnvironmentTag}
+  FargateService:
+    Type: AWS::ECS::Service
+    DependsOn: LoadBalancerListener
+    Properties:
+      ServiceName: !Sub ${ApplicationName}-${ApplicationEnvironmentTag}
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref FargateContainerSecurityGroup
+          Subnets:
+            - !Sub '{{resolve:ssm:/privatesubnet1-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+            - !Sub '{{resolve:ssm:/privatesubnet2-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+      TaskDefinition: !Ref TaskDefinition
+      LoadBalancers:
+        - ContainerName: !Sub ${ApplicationName}-${ApplicationEnvironmentTag}
+          ContainerPort: 8030
+          TargetGroupArn: !Ref TargetGroup
+  FargateContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the Fargate containers
+      VpcId: !Sub '{{resolve:ssm:/vpcID-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+  EcsSecurityGroupIngressFromNLB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the VPC
+      GroupId: !Ref 'FargateContainerSecurityGroup'
+      FromPort: 80
+      ToPort: 8080
+      IpProtocol: TCP
+      CidrIp: 10.12.0.0/18
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ApplicationName}-${ApplicationEnvironmentTag}
+      RequiresCompatibilities:
+        - FARGATE
+      Memory: '1024'
+      Cpu: '256'
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref TaskIamRole
+      ContainerDefinitions:
+        - Name: !Sub ${ApplicationName}-${ApplicationEnvironmentTag}
+          Essential: true
+          Image: !Ref RepositoryUri
+          Environment:
+            - Name: APPLICATION_ENVIRONMENT
+              Value: !Ref ApplicationEnvironmentTag
+            - Name: FIREHOSE_REQUEST
+              Value: !Sub '{{resolve:ssm:/${Portfolio}/${ApplicationEnvironmentTag}/firehoserequest:1}}'
+            - Name: FIREHOSE_RESPONSE
+              Value: !Sub '{{resolve:ssm:/${Portfolio}/${ApplicationEnvironmentTag}/firehoseresponse:1}}'
+            - Name: CDS_CLIENT_ID
+              Value: !Sub '{{resolve:ssm:/${Portfolio}/${ApplicationEnvironmentTag}/cdsclientid:1}}'
+            - Name: CDS_CLIENT_SECRET
+              Value: !Sub '{{resolve:ssm:/${Portfolio}/${ApplicationEnvironmentTag}/cdsclientsecret:1}}'
+            - Name: CDS_API_URL_FOR_TOKEN
+              Value: !Sub '{{resolve:ssm:/${Portfolio}/${ApplicationEnvironmentTag}/cdsapiurltoken:1}}'
+            - Name: CDS_FCA_URL
+              Value: !Sub '{{resolve:ssm:/${Portfolio}/${ApplicationEnvironmentTag}/cdsfcaurl:1}}'
+            - Name: CONVERT_LANG_URL
+              Value: !Sub '{{resolve:ssm:/${Portfolio}/${ApplicationEnvironmentTag}/convertlangurl:1}}'
+            - Name: dBUrl
+              Value: !Sub '{{resolve:ssm:/dB-url-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+            - Name: dBUserName
+              Value: !Sub '{{resolve:ssm:/dbUsername-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+            - Name: dBPassword
+              Value: !Sub '{{resolve:ssm:/dbPassword-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+            - Name: dBDriverClass
+              Value: !Sub '{{resolve:ssm:/dBDriverClass-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+          Memory: 512
+          PortMappings:
+            - ContainerPort: 8030
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub /ecs/${ApplicationName}/${ApplicationEnvironmentTag}
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+              awslogs-create-group: 'true'
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /fca/hello
+      HealthCheckProtocol: HTTP
+      # HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      Port: 8030
+      Protocol: TCP
+      Matcher:
+        HttpCode: 200-399
+      UnhealthyThresholdCount: 5
+      VpcId: !Sub '{{resolve:ssm:/vpcID-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+      TargetType: 'ip'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '300'
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - NetworkLoadBalancer
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'TargetGroup'
+          Type: 'forward'
+      LoadBalancerArn: !Ref 'NetworkLoadBalancer'
+      Port: 8030
+      Protocol: TCP
+  NetworkLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network #defines network
+      Scheme: internal #definesInternal
+      Subnets:
+        - !Sub '{{resolve:ssm:/privatesubnet1-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+        - !Sub '{{resolve:ssm:/privatesubnet2-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+  NLBVpcLink:
+    Type: AWS::ApiGateway::VpcLink
+    Properties:
+        Description: 'Network Load Balancer VPC'
+        Name: !Sub ${ApplicationName}-${ApplicationEnvironmentTag}-vpclink
+        TargetArns:
+            - !Ref NetworkLoadBalancer
+  NLBurlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: NLB endpoint url
+      Name: !Sub /${Portfolio}/${ApplicationEnvironmentTag}/NlbURL
+      Type: String
+      Value: !GetAtt NetworkLoadBalancer.DNSName
+  NLBvpcParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: NLB VPC Id
+      Name: !Sub /${Portfolio}/${ApplicationEnvironmentTag}/VpcLink
+      Type: String
+      Value: !Ref NLBVpcLink
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ecs-tasks.amazonaws.com
+            - ecs.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: !Sub ${ApplicationName}-${ApplicationEnvironmentTag}
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+              # Allow the ECS tasks to upload logs to CloudWatch
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+              Resource:
+              - arn:aws:logs:*:*:*
+            - Effect: Allow
+              Action:
+              # Allow the ECS Tasks to download images from ECR
+              - 'ecr:GetAuthorizationToken'
+              - 'ecr:BatchCheckLayerAvailability'
+              - 'ecr:GetDownloadUrlForLayer'
+              - 'ecr:BatchGetImage'
+              Resource:
+              - "*"
+            - Effect: Allow
+              Action:
+              # Allow the ECS Tasks to push message to Firehose
+              - 'firehose:*'
+              Resource:
+              - "*"
+  TaskIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - ecs-tasks.amazonaws.com
+              - ecs.amazonaws.com
+      Policies:
+        -
+          PolicyName: "InlinePolicy"
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: "Allow"
+                Action: "*"
+                Resource: "*"
+# Lambda for Language support
+  languagesupport:
+    Type:                                       AWS::Serverless::Function
+    Properties:
+      Timeout: 60
+      MemorySize: 512
+      Runtime: 'java8'
+      Tracing: Active
+      FunctionName:                            !Sub 'languagesupport-${ApplicationName}-${ApplicationEnvironmentTag}-${AWS::Region}'
+      Handler:                                 com.cummins.telematics.fetchlanguage.settings.FetchLanguageHandler::handleRequest
+      Role:                                    !GetAtt LambdaRole.Arn
+      CodeUri:                                 languagesupport.jar
+      VpcConfig:
+        SecurityGroupIds:
+            - !Sub '{{resolve:ssm:/securitygroupid-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+        SubnetIds:
+            - !Sub '{{resolve:ssm:/privatesubnet1-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+            - !Sub '{{resolve:ssm:/privatesubnet2-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+      Environment:
+        Variables:
+          dbUrl:                    !Sub '{{resolve:ssm:/dbUrl-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+          dbName:                   !Sub '{{resolve:ssm:/dbName-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+          dbUser:                   !Sub '{{resolve:ssm:/dbUsername-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+          dbPassword:               !Sub '{{resolve:ssm:/dbPassword-${ApplicationName}-${ApplicationEnvironmentTag}:1}}'
+          dbResetInterval:          5
+      Tags:
+          creator: PostMastersTeam
+          application: Faultguidance
+          billingidentifier: 007/A9N
+          business_unit: DA
+          Environment: !Ref ApplicationEnvironmentTag
+          APPLICATION_NAME: !Ref ApplicationName
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Method: POST
+            Path: /languagesupport
+            RestApiId: !Ref ApiGateway
+#API Gateway for Faultguidance
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    DependsOn:
+      - NetworkLoadBalancer
+      - NLBVpcLink
+      - NLBurlParameter
+      - NLBvpcParameter
+    Properties:
+      StageName: !Sub ${ApplicationEnvironmentTag}
+      Name: !Sub ${ApplicationName}-${ApplicationEnvironmentTag}-api
+      Variables:
+        # nlbEndPointLink: !Sub '{{resolve:ssm:/${Portfolio}/${ApplicationEnvironmentTag}/NlbURL:1}}:8030'
+        # vpcLinkId: !Sub '{{resolve:ssm:/${Portfolio}/${ApplicationEnvironmentTag}/VpcLink:1}}'
+        vpcLinkId: !Ref NLBVpcLink
+        nlbEndPointLink:
+          Fn::Join:
+          - ""
+          - - !GetAtt NetworkLoadBalancer.DNSName
+            - ':8030'
+      DefinitionBody:
+        swagger: 2.0
+        info:
+          version: '2017-04-20T04:08:08Z'
+          title: "Faultguidance-API"
+        schemes:
+        - "https"
+        paths:
+          /fca:
+            post:
+              produces:
+              - "application/json"
+              parameters:
+              - name: "common-api-key"
+                in: "header"
+                required: true
+                type: "string"
+              - name: "Content-Type"
+                in: "header"
+                required: true
+                type: "string"
+              responses:
+                '200':
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+              x-amazon-apigateway-integration:
+                uri: "http://${stageVariables.nlbEndPointLink}/fca/v2/faultCodeAnalysis"
+                responses:
+                  default:
+                    statusCode: "200"
+                requestParameters:
+                  integration.request.header.Content-Type: 'method.request.header.Content-Type'
+                  integration.request.header.common-api-key: 'method.request.header.common-api-key'
+                passthroughBehavior: "when_no_match"
+                connectionType: "VPC_LINK"
+                connectionId: "${stageVariables.vpcLinkId}"
+                httpMethod: "POST"
+                type: "http"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                '200':
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+          /languagesupport:
+            post:
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                uri:
+                  Fn::Sub: arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${languagesupport.Arn}/invocations
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                        method.response.header.Access-Control-Allow-Origin: "'*'"
+                passthroughBehavior: "when_no_match"
+                httpMethod: "POST"
+                contentHandling: "CONVERT_TO_TEXT"
+                type: "aws_proxy"
+            options:
+              consumes:
+              - "application/json"
+              produces:
+              - "application/json"
+              responses:
+                "200":
+                  description: "200 response"
+                  schema:
+                    $ref: "#/definitions/Empty"
+                  headers:
+                    Access-Control-Allow-Origin:
+                      type: "string"
+                    Access-Control-Allow-Methods:
+                      type: "string"
+                    Access-Control-Allow-Headers:
+                      type: "string"
+              x-amazon-apigateway-integration:
+                responses:
+                  default:
+                    statusCode: "200"
+                    responseParameters:
+                      method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+                      method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+                      method.response.header.Access-Control-Allow-Origin: "'*'"
+                requestTemplates:
+                  application/json: "{\"statusCode\": 200}"
+                passthroughBehavior: "when_no_match"
+                type: "mock"
+        definitions:
+          Empty:
+            type: "object"
+            title: "Empty Schema"
+# IAM Role for DataPuller Lambdas
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-codepipeline-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+            - Effect: Allow
+              Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource: "*"
+            - Effect: Allow
+              Action:
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DeleteNetworkInterface
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - ssm:GetParametersByPath
+                - ssm:GetParameters
+                - ssm:GetParameter
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+              Resource:
+                - "*"
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:PutBucketVersioning
+                - s3:PutBucketTagging
+                - s3:PutBucketPolicy
+                - s3:PutBucketNotification
+                - s3:PutBucketLogging
+                - s3:PutBucketAcl
+                - s3:ListBucketVersions
+                - s3:ListBucketByTags
+                - s3:ListBucket
+                - s3:ListAllMyBuckets
+                - s3:GetReplicationConfiguration
+                - s3:GetObjectVersionTagging
+                - s3:GetObjectVersionForReplication
+                - s3:GetObjectVersionAcl
+                - s3:GetObjectVersion
+                - s3:GetObjectTagging
+                - s3:GetObjectAcl
+                - s3:GetObject
+                - s3:GetBucketVersioning
+                - s3:GetBucketPolicyStatus
+                - s3:GetBucketPolicy
+                - s3:GetBucketNotification
+                - s3:GetBucketLogging
+                - s3:GetBucketLocation
+                - s3:GetBucketAcl
+                - s3:CreateBucket
+              Resource:
+                - "*"
+            - Effect: Allow
+              Action:
+                - kinesis:DescribeStream
+                - kinesis:PutRecord
+                - kinesis:PutRecords
+                - kinesis:GetShardIterator
+                - kinesis:GetRecords
+                - kinesis:ListStreams
+              Resource:
+                - "*"
+            - Effect: Allow
+              Action:
+                - firehose:PutRecord
+                - firehose:PutRecordBatch
+                - firehose:UpdateDestination
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - dynamodb:*
+              Resource: "*"
+# S3 bucket o insert data
+  FirehoseS3Bucket:
+    Type:                          "AWS::S3::Bucket"
+    Properties:
+      BucketName:                  !Sub "${ApplicationName}-${AWS::Region}-${ApplicationEnvironmentTag}-firehose"
+      LifecycleConfiguration:
+        Rules:
+          - Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            Status: Enabled
+      Tags:
+      - Key:                       Name
+        Value:                     !Sub "${ApplicationName}-Firehose-S3Bucket"
+# Firehose Policies and Roles
+  FirehoseDeliveryRole1:
+    Type:                          'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version:                   2012-10-17
+        Statement:
+          - Sid:                   ''
+            Effect:                Allow
+            Principal:
+              Service:             firehose.amazonaws.com
+            Action:                'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId' : !Ref 'AWS::AccountId'
+      RoleName: !Sub 'Firehose-${ApplicationName}-${ApplicationEnvironmentTag}-Role'
+  FirehoseDeliveryPolicy1:
+    Type:                          'AWS::IAM::Policy'
+    Properties:
+      PolicyName:                  Firehose-Delivery-Policy
+      PolicyDocument:
+        Version:                   2012-10-17
+        Statement:
+          - Effect:                Allow
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref FirehoseS3Bucket
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref FirehoseS3Bucket
+                  - '*'
+      Roles:
+        - !Ref FirehoseDeliveryRole1
+#Firehose
+  KinesisfirehoseRawData:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "${ApplicationName}-${ApplicationEnvironmentTag}-request-data"
+      DeliveryStreamType: "DirectPut"
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt FirehoseS3Bucket.Arn
+        BufferingHints:
+          IntervalInSeconds: "300"
+          SizeInMBs: "50"
+        CompressionFormat: "UNCOMPRESSED"
+        Prefix: !Sub "${ApplicationEnvironmentTag}/data/firehose/Request/"
+        RoleARN: !GetAtt FirehoseDeliveryRole1.Arn
+  KinesisfirehoseBadData:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "${ApplicationName}-${ApplicationEnvironmentTag}-response-data"
+      DeliveryStreamType: "DirectPut"
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt FirehoseS3Bucket.Arn
+        BufferingHints:
+          IntervalInSeconds: "300"
+          SizeInMBs: "50"
+        CompressionFormat: "UNCOMPRESSED"
+        Prefix: !Sub "${ApplicationEnvironmentTag}/data/firehose/Response/"
+        RoleARN: !GetAtt FirehoseDeliveryRole1.Arn
+#SNS topic and Subscription
+  FaultGuidanceTopic:
+    Type:                                    AWS::SNS::Topic
+    Properties:
+      DisplayName:                           FaultGuidanceTopic
+      TopicName:                             !Sub '${ApplicationName}-${ApplicationEnvironmentTag}-FaultGuidanceTopic'
+  FaultGuidanceSubscriptionSNS1:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: pw872@cummins.com
+      TopicArn: !Ref FaultGuidanceTopic
+  FaultGuidanceSubscriptionSNS2:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: kw528@cummins.com
+      TopicArn: !Ref FaultGuidanceTopic
